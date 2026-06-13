@@ -76,9 +76,11 @@ impl<'a> TableRead<'a> {
         let core_options = CoreOptions::new(self.table.schema.options());
         let merge_engine = core_options.merge_engine()?;
 
-        // PK table with Deduplicate engine: splits containing level-0 files
-        // need KeyValueFileReader for sort-merge dedup; splits with only
-        // compacted files (level > 0) can use the faster DataFileReader.
+        // PK table with Deduplicate engine: splits that may hold multiple
+        // versions of a key need KeyValueFileReader for sort-merge dedup;
+        // splits marked raw convertible by scan planning — and all compacted
+        // files of deletion-vector tables, where DVs mask stale versions —
+        // use the faster DataFileReader.
         if has_primary_keys
             && matches!(
                 merge_engine,
@@ -95,8 +97,12 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Read PK table with Deduplicate engine: level-0 splits go through
-    /// KeyValueFileReader for sort-merge dedup, compacted splits use DataFileReader.
+    /// Read PK table with Deduplicate engine: splits marked raw convertible
+    /// by scan planning (mirrors Java `DataSplit#convertToRawFiles`) use the
+    /// faster DataFileReader; the rest go through KeyValueFileReader for
+    /// sort-merge dedup. Deletion-vector tables are exempt: their stale
+    /// versions are masked by DVs, and KeyValueFileReader does not support
+    /// DVs, so they keep the plain level-0 dispatch.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
@@ -106,10 +112,15 @@ impl<'a> TableRead<'a> {
             return self.read_kv(data_splits, core_options);
         }
 
+        // Deletion-vector tables read raw by design: stale versions of a key
+        // are masked by DVs, not merged, and KeyValueFileReader does not
+        // support DVs. Keep the plain level-0 dispatch for them.
+        let dv_enabled = core_options.deletion_vectors_enabled();
+
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
-            if split.data_files().iter().any(|f| f.level == 0) {
+            if pk_split_needs_merge(split, dv_enabled) {
                 kv_splits.push(split.clone());
             } else {
                 raw_splits.push(split.clone());
@@ -190,5 +201,94 @@ impl<'a> TableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
+    }
+}
+
+/// Whether a primary-key split must go through the sort-merge reader.
+///
+/// Mirrors Java `PrimaryKeyTableRawFileSplitReadProvider#match`: a raw read
+/// needs the split marked raw convertible AND a known `delete_row_count` on
+/// every file. Legacy files without the stat may hide delete rows — scan
+/// planning treats the missing stat as "no deletes" for compatibility, so the
+/// read side must fall back to the merge reader, which drops them.
+///
+/// Deletion-vector tables keep the plain level-0 dispatch: stale versions are
+/// masked by DVs and KeyValueFileReader does not support DVs.
+fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
+    if dv_enabled {
+        return split.data_files().iter().any(|f| f.level == 0);
+    }
+    !split.raw_convertible()
+        || split
+            .data_files()
+            .iter()
+            .any(|f| f.delete_row_count.is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRow, DataFileMeta};
+    use crate::table::source::DataSplitBuilder;
+
+    fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: 128,
+            row_count: 10,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count,
+            embedded_index: None,
+            first_row_id: None,
+            write_cols: None,
+            external_path: None,
+            file_source: None,
+            value_stats_cols: None,
+        }
+    }
+
+    fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_raw_convertible(raw_convertible)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_pk_split_needs_merge_routing() {
+        // Raw convertible with known delete counts: raw read.
+        let raw = split(vec![file("a", 5, Some(0))], true);
+        assert!(!pk_split_needs_merge(&raw, false));
+
+        // Not raw convertible: merge read.
+        let merge = split(vec![file("a", 5, Some(0))], false);
+        assert!(pk_split_needs_merge(&merge, false));
+
+        // Raw convertible but a legacy file lacks delete_row_count: the file
+        // may hide delete rows, so it must go through the merge reader.
+        let legacy = split(vec![file("a", 5, None)], true);
+        assert!(pk_split_needs_merge(&legacy, false));
+
+        // Deletion-vector tables dispatch on level 0 only.
+        let dv_l0 = split(vec![file("a", 0, None)], false);
+        assert!(pk_split_needs_merge(&dv_l0, true));
+        let dv_compacted = split(vec![file("a", 5, None)], false);
+        assert!(!pk_split_needs_merge(&dv_compacted, true));
     }
 }
