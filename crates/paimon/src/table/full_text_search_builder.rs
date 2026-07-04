@@ -96,6 +96,8 @@ impl<'a> FullTextSearchBuilder<'a> {
     ///
     /// Reference: `FullTextSearchBuilder.executeLocal()`
     pub async fn execute(&self) -> crate::Result<Vec<RowRange>> {
+        // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let text_column =
             self.text_column
                 .as_deref()
@@ -541,5 +543,19 @@ mod tests {
             false,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_execute_fails_closed_when_query_auth_enabled() {
+        let table = crate::table::query_auth_table();
+        let err = table
+            .new_full_text_search_builder()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "full-text search must fail closed for a query-auth table"
+        );
     }
 }
