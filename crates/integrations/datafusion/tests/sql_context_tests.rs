@@ -24,8 +24,8 @@ use datafusion::datasource::MemTable;
 use paimon::catalog::Identifier;
 use paimon::spec::{
     ArrayType, BinaryType, BlobType, CharType, DataType, FloatType, IntType,
-    LocalZonedTimestampType, MapType, MultisetType, TimeType, VarBinaryType, VarCharType,
-    VectorType,
+    LocalZonedTimestampType, MapType, MultisetType, SchemaChange, TimeType, VarBinaryType,
+    VarCharType, VectorType,
 };
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
@@ -1381,6 +1381,119 @@ async fn test_show_create_table_with_partition_and_options() {
 }
 
 #[tokio::test]
+async fn test_show_create_table_excludes_session_dynamic_options() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) \
+             PARTITIONED BY (pt) WITH ('file.format' = 'parquet')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t VALUES (1, 'one', 1)")
+        .await
+        .expect("INSERT should plan")
+        .collect()
+        .await
+        .expect("INSERT should execute");
+    sql_context
+        .sql("CALL sys.create_tag(table => 'test_db.t', tag => 'before_age')")
+        .await
+        .expect("CREATE TAG should succeed");
+    sql_context
+        .sql("ALTER TABLE paimon.test_db.t ADD COLUMN age INT")
+        .await
+        .expect("ALTER TABLE should succeed");
+    sql_context
+        .sql("SET 'paimon.scan.version' = 'before_age'")
+        .await
+        .expect("SET scan.version should succeed");
+    sql_context
+        .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+        .await
+        .expect("SET blob-as-descriptor should succeed");
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    assert!(
+        definition.contains("'file.format' = 'parquet'"),
+        "definition should keep persisted table options, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"age\" INT"),
+        "definition should use current persisted schema, got: {definition}"
+    );
+    for dynamic_option in ["scan.version", "blob-as-descriptor"] {
+        assert!(
+            !definition.contains(dynamic_option),
+            "definition should not contain session dynamic option {dynamic_option}, got: {definition}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_dynamic_scan_ignores_current_show_create_unsupported_type() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.t (id INT)")
+        .await
+        .expect("CREATE TABLE should succeed");
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t VALUES (1)")
+        .await
+        .expect("INSERT should plan")
+        .collect()
+        .await
+        .expect("INSERT should execute");
+    sql_context
+        .sql("CALL sys.create_tag(table => 'test_db.t', tag => 'before_time')")
+        .await
+        .expect("CREATE TAG should succeed");
+
+    let identifier = Identifier::new("test_db", "t");
+    catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::add_column(
+                "unsupported_col".to_string(),
+                DataType::Time(TimeType::new(3).unwrap()),
+            )],
+            false,
+        )
+        .await
+        .expect("ALTER TABLE should add unsupported SHOW CREATE type");
+
+    sql_context
+        .sql("SET 'paimon.scan.version' = 'before_time'")
+        .await
+        .expect("SET scan.version should succeed");
+
+    let rows = sql_context
+        .sql("SELECT * FROM paimon.test_db.t")
+        .await
+        .expect("dynamic scan should plan with historical schema")
+        .collect()
+        .await
+        .expect("dynamic scan should execute");
+    assert_eq!(rows[0].schema().fields().len(), 1);
+    assert_eq!(rows[0].schema().field(0).name(), "id");
+    let row_count: usize = rows.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(row_count, 1);
+}
+
+#[tokio::test]
 async fn test_show_create_table_various_types() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog).await;
@@ -1703,6 +1816,11 @@ async fn test_show_create_table_rejects_non_round_trippable_types() {
             .create_table(&identifier, schema, false)
             .await
             .expect("table should be created");
+
+        sql_context
+            .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+            .await
+            .expect("SET blob-as-descriptor should succeed");
 
         let err = sql_context
             .sql(&format!("SHOW CREATE TABLE paimon.test_db.{table_name}"))

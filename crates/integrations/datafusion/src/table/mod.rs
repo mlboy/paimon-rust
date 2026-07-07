@@ -69,7 +69,7 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
 pub struct PaimonTableProvider {
     table: Table,
     schema: ArrowSchemaRef,
-    table_definition: String,
+    table_definition: Option<String>,
 }
 
 impl PaimonTableProvider {
@@ -77,10 +77,17 @@ impl PaimonTableProvider {
     ///
     /// Loads the table schema and converts it to Arrow for DataFusion.
     pub fn try_new(table: Table) -> DFResult<Self> {
+        let table_definition = build_table_definition(&table)?;
+        Self::try_new_with_table_definition(table, Some(table_definition))
+    }
+
+    fn try_new_with_table_definition(
+        table: Table,
+        table_definition: Option<String>,
+    ) -> DFResult<Self> {
         let fields = datafusion_read_fields(&table);
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
-        let table_definition = build_table_definition(&table)?;
         Ok(Self {
             table,
             schema,
@@ -97,6 +104,16 @@ impl PaimonTableProvider {
         Self::try_new(table)
     }
 
+    pub(crate) fn try_new_with_blob_reader_registry_and_definition(
+        table: Table,
+        blob_reader_registry: BlobReaderRegistry,
+        table_definition: Option<String>,
+    ) -> DFResult<Self> {
+        blob_reader_registry
+            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        Self::try_new_with_table_definition(table, table_definition)
+    }
+
     pub fn table(&self) -> &Table {
         &self.table
     }
@@ -106,7 +123,7 @@ impl PaimonTableProvider {
 ///
 /// Mirrors the syntax accepted by `SQLContext::handle_create_table`:
 /// `CREATE TABLE <db>.<table> (<col> <type>, ..., PRIMARY KEY (...)) [PARTITIONED BY (...)] [WITH ('k'='v', ...)]`.
-fn build_table_definition(table: &Table) -> DFResult<String> {
+pub(crate) fn build_table_definition(table: &Table) -> DFResult<String> {
     let identifier = table.identifier();
     let schema = table.schema();
     let mut ddl = String::new();
@@ -322,7 +339,7 @@ impl TableProvider for PaimonTableProvider {
     }
 
     fn get_table_definition(&self) -> Option<&str> {
-        Some(&self.table_definition)
+        self.table_definition.as_deref()
     }
 
     async fn scan(
