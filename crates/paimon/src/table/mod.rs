@@ -39,6 +39,7 @@ mod data_file_reader;
 mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
+pub(crate) mod global_index_build_common;
 pub(crate) mod global_index_scanner;
 mod global_index_types;
 mod hybrid_search_builder;
