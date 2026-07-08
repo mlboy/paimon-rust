@@ -16,10 +16,9 @@
 // under the License.
 
 use crate::io::FileIO;
-use crate::spec::{BlobDescriptor, DataField, DataFileMeta, DataType};
+use crate::spec::{BlobViewStruct, DataField, DataFileMeta, DataType};
 use crate::table::data_file_writer::DataFileWriter;
 use crate::Result;
-use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,6 +56,7 @@ pub(crate) struct AppendDedicatedFormatFileWriter {
     vector_writer: Option<VectorFieldWriter>,
     normal_column_indices: Vec<usize>,
     normal_schema: Arc<arrow_schema::Schema>,
+    blob_view_column_indices: Vec<(usize, String)>,
 }
 
 impl AppendDedicatedFormatFileWriter {
@@ -78,7 +78,8 @@ impl AppendDedicatedFormatFileWriter {
         input_schema: &arrow_schema::Schema,
         table_fields: &[DataField],
         format_options: &HashMap<String, String>,
-        blob_descriptor_fields: &HashSet<String>,
+        blob_inline_fields: &HashSet<String>,
+        blob_view_fields: &HashSet<String>,
     ) -> Self {
         let mut normal_column_indices = Vec::new();
         let mut normal_arrow_fields = Vec::new();
@@ -91,7 +92,7 @@ impl AppendDedicatedFormatFileWriter {
 
         for (idx, field) in table_fields.iter().enumerate() {
             let is_blob = field.data_type().is_blob_type();
-            let is_descriptor = blob_descriptor_fields.contains(field.name());
+            let is_inline = blob_inline_fields.contains(field.name());
             let is_dedicated_vector =
                 vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_));
 
@@ -100,7 +101,7 @@ impl AppendDedicatedFormatFileWriter {
                 vector_arrow_fields.push(input_schema.field(idx).clone());
                 vector_table_fields.push(field.clone());
                 vector_field_names.push(field.name().to_string());
-            } else if is_blob && !is_descriptor {
+            } else if is_blob && !is_inline {
                 blob_writers.push(BlobFieldWriter {
                     writer: DataFileWriter::new(
                         file_io.clone(),
@@ -186,6 +187,12 @@ impl AppendDedicatedFormatFileWriter {
             vector_writer,
             normal_column_indices,
             normal_schema,
+            blob_view_column_indices: table_fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| blob_view_fields.contains(field.name()))
+                .map(|(idx, field)| (idx, field.name().to_string()))
+                .collect(),
         }
     }
 
@@ -193,6 +200,8 @@ impl AppendDedicatedFormatFileWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+
+        self.validate_blob_view_columns(batch)?;
 
         // Write normal columns
         let normal_columns: Vec<Arc<dyn arrow_array::Array>> = self
@@ -250,6 +259,47 @@ impl AppendDedicatedFormatFileWriter {
         Ok(())
     }
 
+    fn validate_blob_view_columns(&self, batch: &RecordBatch) -> Result<()> {
+        for (column_index, field_name) in &self.blob_view_column_indices {
+            let Some(col) = batch
+                .column(*column_index)
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+            else {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "blob-view-field '{field_name}' requires a BinaryArray value column"
+                    ),
+                    source: None,
+                });
+            };
+            for row in 0..col.len() {
+                if col.is_null(row) {
+                    continue;
+                }
+                let value = col.value(row);
+                if !BlobViewStruct::is_blob_view_struct(value) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "blob-view-field '{field_name}' requires blob field value to be a serialized BlobViewStruct"
+                        ),
+                        source: None,
+                    });
+                }
+                let view = BlobViewStruct::deserialize(value)?;
+                if view.serialize()?.as_slice() != value {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "blob-view-field '{field_name}' contains a non-canonical BlobViewStruct payload"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
         let mut results = self.normal_writer.prepare_commit().await?;
 
@@ -265,54 +315,4 @@ impl AppendDedicatedFormatFileWriter {
 
         Ok(results)
     }
-}
-
-/// For each row in a blob column, if the value is a serialized `BlobDescriptor`,
-/// resolve it by reading the actual data from the referenced URI+offset+length.
-/// Raw data values are passed through unchanged.
-pub(crate) async fn resolve_blob_column(
-    col: &arrow_array::BinaryArray,
-    file_io: &FileIO,
-) -> Result<arrow_array::BinaryArray> {
-    use crate::io::FileRead;
-    use std::collections::HashMap;
-
-    let mut needs_resolve = false;
-    for i in 0..col.len() {
-        if !col.is_null(i) && BlobDescriptor::is_blob_descriptor(col.value(i)) {
-            needs_resolve = true;
-            break;
-        }
-    }
-
-    if !needs_resolve {
-        return Ok(col.clone());
-    }
-
-    let mut readers: HashMap<String, Box<dyn FileRead>> = HashMap::new();
-    let mut builder = BinaryBuilder::with_capacity(col.len(), 0);
-    for i in 0..col.len() {
-        if col.is_null(i) {
-            builder.append_null();
-        } else {
-            let value = col.value(i);
-            if BlobDescriptor::is_blob_descriptor(value) {
-                let desc = BlobDescriptor::deserialize(value)?;
-                let uri = desc.uri().to_string();
-                if !readers.contains_key(&uri) {
-                    let input = file_io.new_input(&uri)?;
-                    let reader = input.reader().await?;
-                    readers.insert(uri.clone(), Box::new(reader));
-                }
-                let reader = readers.get(&uri).unwrap();
-                let start = desc.offset() as u64;
-                let end = start + desc.length() as u64;
-                let data = reader.read(start..end).await?;
-                builder.append_value(&data);
-            } else {
-                builder.append_value(value);
-            }
-        }
-    }
-    Ok(builder.finish())
 }

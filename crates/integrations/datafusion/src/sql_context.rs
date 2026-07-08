@@ -674,11 +674,13 @@ impl SQLContext {
         let identifier = self.resolve_table_name(&ct.name)?;
 
         let mut builder = paimon::spec::Schema::builder();
+        let table_options = extract_options(&ct.table_options)?;
 
         // Columns
         for col in &ct.columns {
             let paimon_type = column_def_to_paimon_type(col)?;
-            builder = builder.column(col.name.value.clone(), paimon_type);
+            let comment = column_def_comment(col);
+            builder = builder.column_with_description(col.name.value.clone(), paimon_type, comment);
         }
 
         // Primary key from constraints: PRIMARY KEY (col, ...)
@@ -707,7 +709,7 @@ impl SQLContext {
         }
 
         // Table options from WITH ('key' = 'value', ...)
-        for (k, v) in extract_options(&ct.table_options)? {
+        for (k, v) in table_options {
             builder = builder.option(k, v);
         }
 
@@ -907,8 +909,7 @@ impl SQLContext {
         for op in operations {
             match op {
                 AlterTableOperation::AddColumn { column_def, .. } => {
-                    let change = column_def_to_add_column(column_def)?;
-                    changes.push(change);
+                    changes.push(column_def_to_add_column(column_def)?);
                 }
                 AlterTableOperation::DropColumn {
                     column_names,
@@ -1706,14 +1707,25 @@ fn extract_partition_by(sql: &str) -> DFResult<(String, Vec<String>)> {
 /// Convert a sqlparser [`ColumnDef`] to a Paimon [`SchemaChange::AddColumn`].
 fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
     let paimon_type = column_def_to_paimon_type(col)?;
-    Ok(SchemaChange::add_column(
-        col.name.value.clone(),
-        paimon_type,
-    ))
+    let comment = column_def_comment(col);
+
+    Ok(SchemaChange::AddColumn {
+        field_names: vec![col.name.value.clone()],
+        data_type: paimon_type,
+        comment,
+        column_move: None,
+    })
 }
 
 fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
     sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))
+}
+
+fn column_def_comment(col: &ColumnDef) -> Option<String> {
+    col.options.iter().find_map(|opt| match &opt.option {
+        datafusion::sql::sqlparser::ast::ColumnOption::Comment(comment) => Some(comment.clone()),
+        _ => None,
+    })
 }
 
 fn primary_key_column_name(expr: &SqlExpr) -> String {
@@ -2579,6 +2591,7 @@ fn register_table_functions(
     catalog: &Arc<dyn Catalog>,
     default_database: &str,
 ) {
+    crate::blob_view::register_blob_view(ctx, Arc::clone(catalog), default_database);
     crate::vector_search::register_vector_search(ctx, Arc::clone(catalog), default_database);
     #[cfg(feature = "fulltext")]
     crate::full_text_search::register_full_text_search(ctx, Arc::clone(catalog), default_database);
@@ -2593,7 +2606,7 @@ mod tests {
 
     use async_trait::async_trait;
     use paimon::catalog::Database;
-    use paimon::spec::{DataType as PaimonDataType, Schema as PaimonSchema};
+    use paimon::spec::{DataType as PaimonDataType, IntType, Schema as PaimonSchema};
     use paimon::table::Table;
 
     // ==================== Mock Catalog ====================
@@ -2620,12 +2633,14 @@ mod tests {
 
     struct MockCatalog {
         calls: Mutex<Vec<CatalogCall>>,
+        existing_table: Mutex<Option<Table>>,
     }
 
     impl MockCatalog {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                existing_table: Mutex::new(None),
             }
         }
 
@@ -2661,6 +2676,9 @@ mod tests {
             Ok(())
         }
         async fn get_table(&self, _identifier: &Identifier) -> paimon::Result<Table> {
+            if let Some(table) = self.existing_table.lock().unwrap().clone() {
+                return Ok(table);
+            }
             Err(paimon::Error::TableNotExist {
                 full_name: _identifier.to_string(),
             })
