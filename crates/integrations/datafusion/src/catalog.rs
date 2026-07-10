@@ -17,17 +17,23 @@
 
 //! Paimon catalog integration for DataFusion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
-use datafusion::common::plan_datafusion_err;
+use datafusion::common::{plan_datafusion_err, Column};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use paimon::catalog::{Catalog, Identifier};
+use datafusion::execution::SessionState;
+use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::sql::planner::IdentNormalizer;
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Query, Statement, Visit, Visitor};
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser;
+use paimon::catalog::{Catalog, Identifier, View};
 
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
@@ -35,12 +41,15 @@ use crate::system_tables;
 use crate::table::PaimonTableProvider;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
+pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
+
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
 ///
 /// This provider uses lazy loading - databases and tables are fetched
 /// on-demand from the catalog, ensuring data is always fresh.
 pub struct PaimonCatalogProvider {
+    catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
     /// Session-scoped dynamic options shared with the SQL context.
@@ -54,6 +63,7 @@ pub struct PaimonCatalogProvider {
     /// becoming invisible or stale, which is recoverable by re-registering it.
     temp_tables: Arc<RwLock<HashMap<String, Arc<MemorySchemaProvider>>>>,
     blob_reader_registry: BlobReaderRegistry,
+    session_state: Option<SessionStateProvider>,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -64,29 +74,20 @@ impl Debug for PaimonCatalogProvider {
 
 impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
-    ///
-    /// For standalone use without `SET`/`RESET` support.
-    /// When used via [`SQLContext`], the handler creates the provider
-    /// internally with shared dynamic options.
-    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        PaimonCatalogProvider {
-            catalog,
-            dynamic_options: Default::default(),
-            temp_tables: Arc::new(RwLock::new(HashMap::new())),
-            blob_reader_registry: BlobReaderRegistry::default(),
-        }
-    }
-
-    pub(crate) fn with_dynamic_options(
+    pub fn new(
+        catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
         blob_reader_registry: BlobReaderRegistry,
+        session_state: Option<SessionStateProvider>,
     ) -> Self {
         PaimonCatalogProvider {
+            catalog_name,
             catalog,
             dynamic_options,
             temp_tables: Arc::new(RwLock::new(HashMap::new())),
             blob_reader_registry,
+            session_state,
         }
     }
 }
@@ -109,6 +110,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let blob_reader_registry = self.blob_reader_registry.clone();
+        let catalog_name = self.catalog_name.clone();
+        let session_state = self.session_state.clone();
         let name = name.to_string();
 
         let temp_provider = {
@@ -120,20 +123,24 @@ impl CatalogProvider for PaimonCatalogProvider {
             async move {
                 match catalog.get_database(&name).await {
                     Ok(_) => Some(Arc::new(PaimonSchemaProvider::new(
+                        catalog_name,
                         Arc::clone(&catalog),
                         name,
                         dynamic_options,
                         temp_provider,
                         blob_reader_registry,
+                        session_state,
                     )) as Arc<dyn SchemaProvider>),
                     Err(paimon::Error::DatabaseNotExist { .. }) => {
                         if temp_provider.is_some() {
                             Some(Arc::new(PaimonSchemaProvider::new(
+                                catalog_name,
                                 Arc::clone(&catalog),
                                 name,
                                 dynamic_options,
                                 temp_provider,
                                 blob_reader_registry,
+                                session_state,
                             )) as Arc<dyn SchemaProvider>)
                         } else {
                             None
@@ -157,6 +164,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let blob_reader_registry = self.blob_reader_registry.clone();
+        let catalog_name = self.catalog_name.clone();
+        let session_state = self.session_state.clone();
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -165,11 +174,13 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .await
                     .map_err(to_datafusion_error)?;
                 Ok(Some(Arc::new(PaimonSchemaProvider::new(
+                    catalog_name,
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
                     None,
                     blob_reader_registry,
+                    session_state,
                 )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -184,6 +195,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let blob_reader_registry = self.blob_reader_registry.clone();
+        let catalog_name = self.catalog_name.clone();
+        let session_state = self.session_state.clone();
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -192,11 +205,13 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .await
                     .map_err(to_datafusion_error)?;
                 Ok(Some(Arc::new(PaimonSchemaProvider::new(
+                    catalog_name,
                     Arc::clone(&catalog),
                     name,
                     dynamic_options,
                     None,
                     blob_reader_registry,
+                    session_state,
                 )) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -287,6 +302,7 @@ impl PaimonCatalogProvider {
 ///
 /// Tables are loaded lazily when accessed via the `table()` method.
 pub struct PaimonSchemaProvider {
+    catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
     /// Database name this schema represents.
@@ -296,6 +312,7 @@ pub struct PaimonSchemaProvider {
     /// Optional temporary in-memory provider for temp tables and views.
     temp_provider: Option<Arc<MemorySchemaProvider>>,
     blob_reader_registry: BlobReaderRegistry,
+    session_state: Option<SessionStateProvider>,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -308,20 +325,24 @@ impl Debug for PaimonSchemaProvider {
 }
 
 impl PaimonSchemaProvider {
-    /// Creates a new [`PaimonSchemaProvider`] with shared dynamic options.
+    /// Creates a new [`PaimonSchemaProvider`].
     pub fn new(
+        catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         database: String,
         dynamic_options: DynamicOptions,
         temp_provider: Option<Arc<MemorySchemaProvider>>,
         blob_reader_registry: BlobReaderRegistry,
+        session_state: Option<SessionStateProvider>,
     ) -> Self {
         PaimonSchemaProvider {
+            catalog_name,
             catalog,
             database,
             dynamic_options,
             temp_provider,
             blob_reader_registry,
+            session_state,
         }
     }
 }
@@ -335,13 +356,21 @@ impl SchemaProvider for PaimonSchemaProvider {
             {
                 let db = database.clone();
                 async move {
-                    match catalog.list_tables(&db).await {
+                    let mut names = match catalog.list_tables(&db).await {
                         Ok(names) => names,
                         Err(e) => {
                             log::error!("failed to list tables in '{}': {e}", db);
                             vec![]
                         }
+                    };
+                    match catalog.list_views(&db).await {
+                        Ok(views) => names.extend(views),
+                        Err(paimon::Error::Unsupported { .. }) => {}
+                        Err(error) => {
+                            log::error!("failed to list views in '{}': {error}", db);
+                        }
                     }
+                    names
                 }
             },
             "paimon catalog access thread panicked",
@@ -378,6 +407,8 @@ impl SchemaProvider for PaimonSchemaProvider {
         let catalog = Arc::clone(&self.catalog);
         let dynamic_options = Arc::clone(&self.dynamic_options);
         let blob_reader_registry = self.blob_reader_registry.clone();
+        let catalog_name = self.catalog_name.clone();
+        let session_state = self.session_state.clone();
         let identifier = Identifier::new(self.database.clone(), object.table().to_string());
         let branch = object.branch().map(str::to_string);
         await_with_runtime(async move {
@@ -412,7 +443,51 @@ impl SchemaProvider for PaimonSchemaProvider {
                     };
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                 }
-                Err(paimon::Error::TableNotExist { .. }) => Ok(None),
+                Err(paimon::Error::TableNotExist { .. }) => {
+                    if branch.is_some() {
+                        return Ok(None);
+                    }
+                    let view = match catalog.get_view(&identifier).await {
+                        Ok(view) => view,
+                        Err(paimon::Error::ViewNotExist { .. })
+                        | Err(paimon::Error::Unsupported { .. }) => return Ok(None),
+                        Err(error) => return Err(to_datafusion_error(error)),
+                    };
+                    let catalog_name = catalog_name.ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "REST catalog view '{}' requires a session-aware catalog provider",
+                            identifier.full_name()
+                        )
+                    })?;
+                    validate_view_dependencies(&catalog, &catalog_name, &view).await?;
+                    let mut state = session_state
+                        .and_then(|provider| provider())
+                        .ok_or_else(|| {
+                            plan_datafusion_err!(
+                                "DataFusion session is unavailable while planning REST catalog view '{}'",
+                                identifier.full_name()
+                            )
+                        })?;
+                    state.config_mut().options_mut().catalog.default_catalog =
+                        catalog_name.clone();
+                    state.config_mut().options_mut().catalog.default_schema =
+                        identifier.database().to_string();
+                    let catalogs =
+                        HashMap::from([(catalog_name.clone(), Arc::clone(&catalog))]);
+                    let query = crate::sql_function::expand_sql(
+                        view.query_for("datafusion"),
+                        &catalogs,
+                        &catalog_name,
+                        identifier.database(),
+                    )
+                    .await?;
+                    let plan = state.create_logical_plan(&query).await?;
+                    let plan = enforce_view_schema(plan, &view)?;
+                    Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
+                        plan,
+                        Some(query),
+                    )) as Arc<dyn TableProvider>))
+                }
                 Err(e) => Err(to_datafusion_error(e)),
             }
         })
@@ -458,7 +533,20 @@ impl SchemaProvider for PaimonSchemaProvider {
                             true
                         }
                     }
-                    Err(paimon::Error::TableNotExist { .. }) => false,
+                    Err(paimon::Error::TableNotExist { .. }) => {
+                        if branch.is_some() {
+                            return false;
+                        }
+                        match catalog.get_view(&identifier).await {
+                            Ok(_) => true,
+                            Err(paimon::Error::ViewNotExist { .. })
+                            | Err(paimon::Error::Unsupported { .. }) => false,
+                            Err(error) => {
+                                log::error!("failed to check view '{}': {error}", identifier);
+                                false
+                            }
+                        }
+                    }
                     Err(e) => {
                         log::error!("failed to check table '{}': {e}", identifier);
                         false
@@ -499,5 +587,297 @@ impl SchemaProvider for PaimonSchemaProvider {
             },
             "paimon catalog access thread panicked",
         )
+    }
+}
+
+fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> {
+    let declared_fields = view.schema().fields();
+    let actual_fields = plan.schema().fields();
+    if actual_fields.len() != declared_fields.len() {
+        return Err(plan_datafusion_err!(
+            "REST catalog view '{}' declares {} fields but its query returns {}",
+            view.full_name(),
+            declared_fields.len(),
+            actual_fields.len()
+        ));
+    }
+
+    let expressions = declared_fields
+        .iter()
+        .enumerate()
+        .map(|(index, declared)| {
+            let (qualifier, actual) = plan.schema().qualified_field(index);
+            let column = match qualifier {
+                Some(qualifier) => Column::new(Some(qualifier.clone()), actual.name()),
+                None => Column::new_unqualified(actual.name()),
+            };
+            let target_type = paimon::arrow::paimon_type_to_arrow(declared.data_type())
+                .map_err(to_datafusion_error)?;
+            Ok(cast(Expr::Column(column), target_type).alias(declared.name()))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    LogicalPlanBuilder::from(plan).project(expressions)?.build()
+}
+
+const MAX_VIEW_DEPENDENCIES: usize = 64;
+
+async fn validate_view_dependencies(
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    root: &View,
+) -> DFResult<()> {
+    let mut queue = VecDeque::from([root.clone()]);
+    let mut loaded = HashSet::from([root.identifier().clone()]);
+    let mut dependencies = HashMap::<Identifier, Vec<Identifier>>::new();
+
+    while let Some(view) = queue.pop_front() {
+        let candidates = view_relation_identifiers(&view, catalog_name)?;
+        let mut view_dependencies = Vec::new();
+        for identifier in candidates {
+            match catalog.get_table(&identifier).await {
+                Ok(_) => continue,
+                Err(paimon::Error::TableNotExist { .. })
+                | Err(paimon::Error::Unsupported { .. }) => {}
+                Err(error) => return Err(to_datafusion_error(error)),
+            }
+
+            let dependency = match catalog.get_view(&identifier).await {
+                Ok(view) => view,
+                Err(paimon::Error::ViewNotExist { .. })
+                | Err(paimon::Error::Unsupported { .. }) => continue,
+                Err(error) => return Err(to_datafusion_error(error)),
+            };
+            view_dependencies.push(identifier.clone());
+            if loaded.insert(identifier) {
+                if loaded.len() > MAX_VIEW_DEPENDENCIES {
+                    return Err(plan_datafusion_err!(
+                        "REST catalog view '{}' exceeds the dependency limit of {}",
+                        root.full_name(),
+                        MAX_VIEW_DEPENDENCIES
+                    ));
+                }
+                queue.push_back(dependency);
+            }
+        }
+        dependencies.insert(view.identifier().clone(), view_dependencies);
+
+        if let Some(cycle) = find_view_dependency_cycle(&dependencies) {
+            let path = cycle
+                .iter()
+                .map(Identifier::full_name)
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            return Err(plan_datafusion_err!(
+                "recursive REST catalog view dependency detected: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
+    let statements =
+        Parser::parse_sql(&GenericDialect {}, view.query_for("datafusion")).map_err(|error| {
+            plan_datafusion_err!(
+                "Invalid SQL for REST catalog view '{}': {error}",
+                view.full_name()
+            )
+        })?;
+    if statements.len() != 1 {
+        return Err(plan_datafusion_err!(
+            "REST catalog view '{}' must contain exactly one SQL statement",
+            view.full_name()
+        ));
+    }
+    if !matches!(statements.first(), Some(Statement::Query(_))) {
+        return Err(plan_datafusion_err!(
+            "REST catalog view '{}' must contain a single read-only query",
+            view.full_name()
+        ));
+    }
+
+    let mut visitor = ViewRelationVisitor::new(catalog_name, view.identifier().database());
+    let _: std::ops::ControlFlow<()> = statements.visit(&mut visitor);
+    Ok(visitor.identifiers)
+}
+
+type SqlIdentifierKey = String;
+
+struct QueryCteScope {
+    visible: HashSet<SqlIdentifierKey>,
+    cte_query_visibility: HashMap<usize, HashSet<SqlIdentifierKey>>,
+}
+
+struct ViewRelationVisitor<'a> {
+    catalog_name: &'a str,
+    current_database: &'a str,
+    scopes: Vec<QueryCteScope>,
+    identifiers: Vec<Identifier>,
+}
+
+impl<'a> ViewRelationVisitor<'a> {
+    fn new(catalog_name: &'a str, current_database: &'a str) -> Self {
+        Self {
+            catalog_name,
+            current_database,
+            scopes: Vec::new(),
+            identifiers: Vec::new(),
+        }
+    }
+}
+
+impl Visitor for ViewRelationVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        let query_address = query as *const Query as usize;
+        let inherited = self
+            .scopes
+            .last()
+            .map(|scope| {
+                scope
+                    .cte_query_visibility
+                    .get(&query_address)
+                    .unwrap_or(&scope.visible)
+                    .clone()
+            })
+            .unwrap_or_default();
+        let mut visible = inherited.clone();
+        let mut cte_query_visibility = HashMap::new();
+
+        if let Some(with) = &query.with {
+            let local_ctes = with
+                .cte_tables
+                .iter()
+                .map(|cte| sql_identifier_key(&cte.alias.name))
+                .collect::<Vec<_>>();
+            if with.recursive {
+                visible.extend(local_ctes);
+                for cte in &with.cte_tables {
+                    cte_query_visibility
+                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
+                }
+            } else {
+                for (cte, alias) in with.cte_tables.iter().zip(local_ctes) {
+                    cte_query_visibility
+                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
+                    visible.insert(alias);
+                }
+            }
+        }
+
+        self.scopes.push(QueryCteScope {
+            visible,
+            cte_query_visibility,
+        });
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        self.scopes.pop();
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
+        let is_cte = match relation.0.as_slice() {
+            [part] => part.as_ident().is_some_and(|identifier| {
+                self.scopes
+                    .last()
+                    .is_some_and(|scope| scope.visible.contains(&sql_identifier_key(identifier)))
+            }),
+            _ => false,
+        };
+        if !is_cte {
+            if let Some(identifier) =
+                relation_identifier(relation, self.catalog_name, self.current_database)
+            {
+                self.identifiers.push(identifier);
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
+    IdentNormalizer::default().normalize(identifier.clone())
+}
+
+fn relation_identifier(
+    relation: &ObjectName,
+    catalog_name: &str,
+    current_database: &str,
+) -> Option<Identifier> {
+    let parts = relation
+        .0
+        .iter()
+        .map(|part| part.as_ident().map(sql_identifier_key))
+        .collect::<Option<Vec<_>>>()?;
+    match parts.as_slice() {
+        [object] => Some(Identifier::new(current_database, object.as_str())),
+        [database, object] => Some(Identifier::new(database.as_str(), object.as_str())),
+        [catalog, database, object] if catalog == catalog_name => {
+            Some(Identifier::new(database.as_str(), object.as_str()))
+        }
+        _ => None,
+    }
+}
+
+fn find_view_dependency_cycle(
+    dependencies: &HashMap<Identifier, Vec<Identifier>>,
+) -> Option<Vec<Identifier>> {
+    fn visit(
+        identifier: &Identifier,
+        dependencies: &HashMap<Identifier, Vec<Identifier>>,
+        finished: &mut HashSet<Identifier>,
+        path: &mut Vec<Identifier>,
+    ) -> Option<Vec<Identifier>> {
+        if let Some(start) = path.iter().position(|entry| entry == identifier) {
+            let mut cycle = path[start..].to_vec();
+            cycle.push(identifier.clone());
+            return Some(cycle);
+        }
+        if finished.contains(identifier) {
+            return None;
+        }
+
+        path.push(identifier.clone());
+        if let Some(next_identifiers) = dependencies.get(identifier) {
+            for next in next_identifiers {
+                if let Some(cycle) = visit(next, dependencies, finished, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+        path.pop();
+        finished.insert(identifier.clone());
+        None
+    }
+
+    let mut finished = HashSet::new();
+    for identifier in dependencies.keys() {
+        if let Some(cycle) = visit(identifier, dependencies, &mut finished, &mut Vec::new()) {
+            return Some(cycle);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relation_identifiers_follow_datafusion_normalization() {
+        let relation = ObjectName(vec![
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("PAIMON")),
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("DEFAULT")),
+            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(Ident::new("ANSWER_VIEW")),
+        ]);
+
+        assert_eq!(
+            relation_identifier(&relation, "paimon", "unused"),
+            Some(Identifier::new("default", "answer_view"))
+        );
     }
 }
