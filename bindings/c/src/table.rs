@@ -641,6 +641,20 @@ unsafe fn datum_from_c(d: &paimon_datum) -> Result<Datum, *mut paimon_error> {
     }
 }
 
+/// Map a C escape byte to the core's `Option<char>` escape parameter.
+///
+/// `0` (NUL) means "use the core default escape" (`None`; the core resolves it
+/// to `\`). Any other byte is the escape character. `c_char` is signed on the
+/// target platforms, so the byte is taken through `u8` before `char` to avoid
+/// sign extension.
+fn escape_char_from_c(escape: std::ffi::c_char) -> Option<char> {
+    if escape == 0 {
+        None
+    } else {
+        Some(escape as u8 as char)
+    }
+}
+
 /// Coerce an integer-family datum to match the target column's integer type.
 ///
 /// FFI callers (e.g. Go) often pass a narrower integer literal (Int) for a
@@ -1142,7 +1156,223 @@ pub unsafe extern "C" fn paimon_predicate_is_not_in_with_case_sensitive(
     )
 }
 
-/// Helper to build an IN/NOT IN predicate with a datum array.
+/// Create a starts-with predicate: `column LIKE 'datum%'` (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_starts_with(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.starts_with(col, d)
+    })
+}
+
+/// Create a starts-with predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_starts_with_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
+        pb.starts_with(col, d)
+    })
+}
+
+/// Create an ends-with predicate: `column LIKE '%datum'` (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_ends_with(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.ends_with(col, d)
+    })
+}
+
+/// Create an ends-with predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_ends_with_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
+        pb.ends_with(col, d)
+    })
+}
+
+/// Create a contains predicate: `column LIKE '%datum%'` (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_contains(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, true, |pb, col, d| {
+        pb.contains(col, d)
+    })
+}
+
+/// Create a contains predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_contains_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    datum: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    build_leaf_predicate_datum(table, column, &datum, case_sensitive, |pb, col, d| {
+        pb.contains(col, d)
+    })
+}
+
+/// Create a LIKE predicate: `column LIKE pattern ESCAPE escape` (case-sensitive
+/// column match). `escape == 0` uses the default escape character.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_like(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    pattern: paimon_datum,
+    escape: std::ffi::c_char,
+) -> paimon_result_predicate {
+    let escape_opt = escape_char_from_c(escape);
+    build_leaf_predicate_datum(table, column, &pattern, true, move |pb, col, d| {
+        pb.like(col, d, escape_opt)
+    })
+}
+
+/// Create a LIKE predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_like_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    pattern: paimon_datum,
+    escape: std::ffi::c_char,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    let escape_opt = escape_char_from_c(escape);
+    build_leaf_predicate_datum(
+        table,
+        column,
+        &pattern,
+        case_sensitive,
+        move |pb, col, d| pb.like(col, d, escape_opt),
+    )
+}
+
+/// Create a BETWEEN predicate: `low <= column <= high` (inclusive, case-sensitive
+/// column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_between(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(table, column, datums.as_ptr(), 2, true, |pb, col, ds| {
+        pb.between(col, ds[0].clone(), ds[1].clone())
+    })
+}
+
+/// Create a BETWEEN predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_between_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(
+        table,
+        column,
+        datums.as_ptr(),
+        2,
+        case_sensitive,
+        |pb, col, ds| pb.between(col, ds[0].clone(), ds[1].clone()),
+    )
+}
+
+/// Create a NOT BETWEEN predicate: `column < low OR column > high`
+/// (case-sensitive column match).
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_not_between(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(table, column, datums.as_ptr(), 2, true, |pb, col, ds| {
+        pb.not_between(col, ds[0].clone(), ds[1].clone())
+    })
+}
+
+/// Create a NOT BETWEEN predicate with configurable column-name case sensitivity.
+///
+/// # Safety
+/// `table` and `column` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_not_between_with_case_sensitive(
+    table: *const paimon_table,
+    column: *const std::ffi::c_char,
+    low: paimon_datum,
+    high: paimon_datum,
+    case_sensitive: bool,
+) -> paimon_result_predicate {
+    let datums = [low, high];
+    build_leaf_predicate_datums(
+        table,
+        column,
+        datums.as_ptr(),
+        2,
+        case_sensitive,
+        |pb, col, ds| pb.not_between(col, ds[0].clone(), ds[1].clone()),
+    )
+}
+
+/// Helper to build a predicate from a datum array (IN / NOT IN, BETWEEN / NOT
+/// BETWEEN).
 unsafe fn build_leaf_predicate_datums(
     table: *const paimon_table,
     column: *const std::ffi::c_char,
@@ -1347,3 +1577,275 @@ const _: unsafe extern "C" fn(
     *const paimon_datum,
     usize,
 ) -> paimon_result_predicate = paimon_predicate_is_not_in;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_starts_with;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_ends_with;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_contains;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+    std::ffi::c_char,
+) -> paimon_result_predicate = paimon_predicate_like;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_between;
+const _: unsafe extern "C" fn(
+    *const paimon_table,
+    *const std::ffi::c_char,
+    paimon_datum,
+    paimon_datum,
+) -> paimon_result_predicate = paimon_predicate_not_between;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::paimon_error_free;
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+    use paimon::table::Table;
+    use std::ffi::CString;
+
+    /// Build an in-memory table with one varchar column `name` and one int
+    /// column `age`, boxed in the exact wrapper shape `paimon_table_free`
+    /// expects, so the same free path is exercised.
+    fn boxed_test_table() -> *mut paimon_table {
+        let schema = Schema::builder()
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("age", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "c_predicate_test"),
+            "memory:/c_predicate_test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let inner = Box::into_raw(Box::new(table)) as *mut std::ffi::c_void;
+        Box::into_raw(Box::new(paimon_table { inner }))
+    }
+
+    /// A string `paimon_datum` borrowing `s` (kept alive by the caller).
+    fn string_datum(s: &std::ffi::CStr) -> paimon_datum {
+        let bytes = s.to_bytes();
+        paimon_datum {
+            tag: 7,
+            int_val: 0,
+            double_val: 0.0,
+            str_data: bytes.as_ptr(),
+            str_len: bytes.len(),
+            int_val2: 0,
+            uint_val: 0,
+            uint_val2: 0,
+        }
+    }
+
+    /// An int (tag 3) `paimon_datum`.
+    fn int_datum(v: i64) -> paimon_datum {
+        paimon_datum {
+            tag: 3,
+            int_val: v,
+            double_val: 0.0,
+            str_data: std::ptr::null(),
+            str_len: 0,
+            int_val2: 0,
+            uint_val: 0,
+            uint_val2: 0,
+        }
+    }
+
+    /// Assert the result is a built predicate (predicate non-null, error null)
+    /// and free it.
+    unsafe fn assert_ok_and_free(result: paimon_result_predicate) {
+        assert!(!result.predicate.is_null(), "expected a predicate");
+        assert!(result.error.is_null(), "expected no error");
+        paimon_predicate_free(result.predicate);
+    }
+
+    /// Assert the result is an error (predicate null, error non-null) and free it.
+    unsafe fn assert_err_and_free(result: paimon_result_predicate) {
+        assert!(result.predicate.is_null(), "expected no predicate");
+        assert!(!result.error.is_null(), "expected an error");
+        paimon_error_free(result.error);
+    }
+
+    #[test]
+    fn escape_char_from_c_maps_sentinel_and_bytes() {
+        assert_eq!(escape_char_from_c(0), None);
+        assert_eq!(escape_char_from_c(b'\\' as std::ffi::c_char), Some('\\'));
+    }
+
+    #[test]
+    fn string_ops_build_predicates() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("name").unwrap();
+            let pat = CString::new("ab").unwrap();
+
+            assert_ok_and_free(paimon_predicate_starts_with(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+            ));
+            assert_ok_and_free(paimon_predicate_ends_with(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+            ));
+            assert_ok_and_free(paimon_predicate_contains(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn like_builds_and_rejects_bad_escape() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("name").unwrap();
+            let pat = CString::new("ab%").unwrap();
+
+            // Default escape (sentinel 0) -> resolves to core default '\'.
+            assert_ok_and_free(paimon_predicate_like(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+                0,
+            ));
+            // Explicit backslash escape -> accepted.
+            assert_ok_and_free(paimon_predicate_like(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+                b'\\' as std::ffi::c_char,
+            ));
+            // Non-backslash escape -> core rejects -> error result.
+            assert_err_and_free(paimon_predicate_like(
+                table,
+                col.as_ptr(),
+                string_datum(&pat),
+                b'/' as std::ffi::c_char,
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn contains_rejects_non_string_datum() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("name").unwrap();
+            // An int datum into a string op -> core's typed error, not a panic.
+            assert_err_and_free(paimon_predicate_contains(table, col.as_ptr(), int_datum(5)));
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn range_ops_build_predicates() {
+        unsafe {
+            let table = boxed_test_table();
+            let col = CString::new("age").unwrap();
+
+            // low <= high -> normal predicate.
+            assert_ok_and_free(paimon_predicate_between(
+                table,
+                col.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+            ));
+            assert_ok_and_free(paimon_predicate_not_between(
+                table,
+                col.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+            ));
+            // low > high -> core short-circuits (AlwaysFalse / is_not_null),
+            // still a built predicate, not an error.
+            assert_ok_and_free(paimon_predicate_between(
+                table,
+                col.as_ptr(),
+                int_datum(20),
+                int_datum(10),
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+
+    #[test]
+    fn with_case_sensitive_variants_build_predicates() {
+        // Touch every `_with_case_sensitive` symbol so all twelve new FFI
+        // entry points are exercised, not just the default-case-sensitive ones.
+        unsafe {
+            let table = boxed_test_table();
+            let name = CString::new("name").unwrap();
+            let age = CString::new("age").unwrap();
+            let pat = CString::new("ab").unwrap();
+            let like_pat = CString::new("ab%").unwrap();
+
+            assert_ok_and_free(paimon_predicate_starts_with_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&pat),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_ends_with_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&pat),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_contains_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&pat),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_like_with_case_sensitive(
+                table,
+                name.as_ptr(),
+                string_datum(&like_pat),
+                0,
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_between_with_case_sensitive(
+                table,
+                age.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+                false,
+            ));
+            assert_ok_and_free(paimon_predicate_not_between_with_case_sensitive(
+                table,
+                age.as_ptr(),
+                int_datum(10),
+                int_datum(20),
+                false,
+            ));
+
+            paimon_table_free(table);
+        }
+    }
+}
