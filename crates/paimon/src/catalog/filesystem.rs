@@ -189,13 +189,47 @@ impl FileSystemCatalog {
     }
 
     /// Check if a database exists.
+    ///
+    /// Uses a trailing slash so that object stores (OSS, S3, etc.) correctly
+    /// identify the path as a directory rather than a file.
+    /// Without trailing slash, `op.exists("dir")` may return false on object
+    /// stores even when `dir/` prefix contains objects.
+    /// See: <https://docs.rs/opendal/latest/opendal/struct.Operator.html#method.stat>
     async fn database_exists(&self, name: &str) -> Result<bool> {
-        self.file_io.exists(&self.database_path(name)).await
+        let raw = self.database_path(name);
+        let path = format!("{}/", raw.trim_end_matches('/'));
+        self.file_io.exists(&path).await
     }
 
-    /// Check if a table exists.
+    /// Check if a table exists by verifying that at least one schema file is
+    /// present under `{table_path}/schema/`.
+    ///
+    /// This mirrors Java's `AbstractCatalog.tableExistsInFileSystem` which
+    /// checks `schema-0` first, then falls back to listing all schema IDs.
+    /// A bare directory without schema files is NOT considered a valid table.
     async fn table_exists(&self, identifier: &Identifier) -> Result<bool> {
-        self.file_io.exists(&self.table_path(identifier)).await
+        let table_path = self.table_path(identifier);
+        self.table_exists_in_filesystem(&table_path).await
+    }
+
+    /// Verify a table path contains valid schema metadata.
+    ///
+    /// Mirrors Java's `AbstractCatalog.tableExistsInFileSystem`:
+    /// 1. Fast path — check if `schema/schema-0` exists.
+    /// 2. Slow path — list schema directory for any `schema-{N}` file.
+    ///
+    /// If the schema directory is missing entirely (e.g. on local filesystem),
+    /// the list operation may error; this is treated as "table does not exist".
+    async fn table_exists_in_filesystem(&self, table_path: &str) -> Result<bool> {
+        let schema_0_path = self.schema_file_path(table_path, 0);
+        if self.file_io.exists(&schema_0_path).await? {
+            return Ok(true);
+        }
+        let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
+        match manager.list_all_ids().await {
+            Ok(ids) => Ok(!ids.is_empty()),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -322,7 +356,18 @@ impl Catalog for FileSystemCatalog {
             });
         }
 
-        self.list_directories(&path).await
+        // Mirror Java's listTablesInFileSystem: only include directories that
+        // contain at least one schema file (i.e. are valid Paimon tables).
+        let dirs = self.list_directories(&path).await?;
+        let mut tables = Vec::new();
+        for dir in dirs {
+            let table_path = make_path(&path, &dir);
+            if self.table_exists_in_filesystem(&table_path).await? {
+                tables.push(dir);
+            }
+        }
+        tables.sort();
+        Ok(tables)
     }
 
     async fn create_table(
