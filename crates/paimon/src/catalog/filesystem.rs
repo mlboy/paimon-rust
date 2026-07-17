@@ -218,8 +218,9 @@ impl FileSystemCatalog {
     /// 1. Fast path — check if `schema/schema-0` exists.
     /// 2. Slow path — list schema directory for any `schema-{N}` file.
     ///
-    /// If the schema directory is missing entirely (e.g. on local filesystem),
-    /// the list operation may error; this is treated as "table does not exist".
+    /// Only a `NotFound` error from the schema directory is treated as
+    /// "table does not exist." All other errors (permission, network, etc.)
+    /// are propagated to avoid masking real failures.
     async fn table_exists_in_filesystem(&self, table_path: &str) -> Result<bool> {
         let schema_0_path = self.schema_file_path(table_path, 0);
         if self.file_io.exists(&schema_0_path).await? {
@@ -228,7 +229,12 @@ impl FileSystemCatalog {
         let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
         match manager.list_all_ids().await {
             Ok(ids) => Ok(!ids.is_empty()),
-            Err(_) => Ok(false),
+            Err(Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
     }
 }
