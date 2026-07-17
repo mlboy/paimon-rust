@@ -1211,6 +1211,164 @@ mod tests {
             .unwrap();
     }
 
+    // ─── table_exists_in_filesystem regression tests ─────────────────────────
+
+    /// When `schema-0` is absent but another schema file (e.g. `schema-5`) exists,
+    /// the slow-path fallback via `list_all_ids` should detect the table.
+    #[tokio::test]
+    async fn test_table_exists_schema_fallback_without_schema_0() {
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        let table_path = format!(
+            "{}/{}/mytable",
+            temp_dir.path().to_str().unwrap(),
+            "db.db"
+        );
+        let schema_dir = format!("{table_path}/schema");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+
+        // Write only schema-5 (skip schema-0) to trigger the slow path.
+        let schema = testing_schema();
+        let table_schema = TableSchema::new(5, &schema);
+        let json = serde_json::to_string(&table_schema).unwrap();
+        std::fs::write(format!("{schema_dir}/schema-5"), json).unwrap();
+
+        assert!(
+            catalog
+                .table_exists_in_filesystem(&table_path)
+                .await
+                .unwrap(),
+            "table with schema-5 (but no schema-0) should be detected via fallback"
+        );
+    }
+
+    /// A directory without any `schema-{N}` file (markerless prefix) should NOT
+    /// be recognized as a valid table.
+    #[tokio::test]
+    async fn test_table_exists_returns_false_for_markerless_directory() {
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        let table_path = format!("{}/{}/bare_dir", temp_dir.path().to_str().unwrap(), "db.db");
+        // Create the directory but no schema/ subdirectory at all.
+        std::fs::create_dir_all(&table_path).unwrap();
+
+        assert!(
+            !catalog
+                .table_exists_in_filesystem(&table_path)
+                .await
+                .unwrap(),
+            "directory without schema/ should not be treated as a table"
+        );
+    }
+
+    /// A directory with an empty `schema/` subdirectory (no schema-N files)
+    /// should NOT be recognized as a valid table.
+    #[tokio::test]
+    async fn test_table_exists_returns_false_for_empty_schema_dir() {
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        let table_path = format!(
+            "{}/{}/empty_schema",
+            temp_dir.path().to_str().unwrap(),
+            "db.db"
+        );
+        let schema_dir = format!("{table_path}/schema");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+
+        assert!(
+            !catalog
+                .table_exists_in_filesystem(&table_path)
+                .await
+                .unwrap(),
+            "directory with empty schema/ should not be treated as a table"
+        );
+    }
+
+    /// `list_tables` must filter out directories that exist but lack valid schema
+    /// metadata (invalid-directory filtering).
+    #[tokio::test]
+    async fn test_list_tables_filters_invalid_directories() {
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        // Create a valid table via the catalog API.
+        let id = Identifier::new("db", "valid_table");
+        catalog
+            .create_table(&id, testing_schema(), false)
+            .await
+            .unwrap();
+
+        // Manually create bare directories (markerless prefixes) that should be
+        // excluded from the listing.
+        let db_path = format!("{}/{}", temp_dir.path().to_str().unwrap(), "db.db");
+        std::fs::create_dir_all(format!("{db_path}/no_schema_at_all")).unwrap();
+        std::fs::create_dir_all(format!("{db_path}/has_empty_schema/schema")).unwrap();
+
+        let tables = catalog.list_tables("db").await.unwrap();
+        assert_eq!(
+            tables,
+            vec!["valid_table".to_string()],
+            "only directories with valid schema files should be listed"
+        );
+    }
+
+    /// Non-`NotFound` errors (e.g. permission denied) from the schema directory
+    /// must be propagated, not swallowed as "table does not exist".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_table_exists_propagates_non_not_found_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        let table_path = format!(
+            "{}/{}/forbidden",
+            temp_dir.path().to_str().unwrap(),
+            "db.db"
+        );
+        let schema_dir = format!("{table_path}/schema");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+
+        // Remove all permissions so listing will fail with PermissionDenied.
+        std::fs::set_permissions(&schema_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Probe whether the OS actually enforces the restriction (root bypasses).
+        let enforced = std::fs::read_dir(&schema_dir).is_err();
+
+        let result = catalog.table_exists_in_filesystem(&table_path).await;
+
+        // Restore permissions before asserting so cleanup can succeed.
+        std::fs::set_permissions(&schema_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if enforced {
+            assert!(
+                result.is_err(),
+                "permission error should be propagated, not treated as 'table not found'; got {result:?}"
+            );
+        }
+    }
+
+    // ─── end table_exists_in_filesystem regression tests ────────────────────────
+
     #[tokio::test]
     async fn test_alter_table_rename_primary_key_column_propagates() {
         let (_tmp, catalog) = create_test_catalog();
