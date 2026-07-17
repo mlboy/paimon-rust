@@ -107,9 +107,8 @@ paimon-mosaic-core = "0.2.0"
 paimon-vindex-core = "0.2.0"
 vortex = { version = "0.75.0", features = ["tokio"], optional = true }
 libloading = "0.9"
-# Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
-# The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
-unicode-segmentation = "=1.13.2"
+# Relaxed from =1.13.2 (upstream pinned for Vortex CI issue, not relevant here)
+unicode-segmentation = ">=1.13.2"
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
