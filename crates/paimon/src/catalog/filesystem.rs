@@ -196,9 +196,7 @@ impl FileSystemCatalog {
     /// stores even when `dir/` prefix contains objects.
     /// See: <https://docs.rs/opendal/latest/opendal/struct.Operator.html#method.stat>
     async fn database_exists(&self, name: &str) -> Result<bool> {
-        let raw = self.database_path(name);
-        let path = format!("{}/", raw.trim_end_matches('/'));
-        self.file_io.exists(&path).await
+        self.file_io.exists_dir(&self.database_path(name)).await
     }
 
     /// Check if a table exists by verifying that at least one schema file is
@@ -222,12 +220,12 @@ impl FileSystemCatalog {
     /// "table does not exist." All other errors (permission, network, etc.)
     /// are propagated to avoid masking real failures.
     async fn table_exists_in_filesystem(&self, table_path: &str) -> Result<bool> {
-        let schema_0_path = self.schema_file_path(table_path, 0);
-        if self.file_io.exists(&schema_0_path).await? {
+        let schema_manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
+
+        if self.file_io.exists(&schema_manager.schema_path(0)).await? {
             return Ok(true);
         }
-        let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
-        match manager.list_all_ids().await {
+        match schema_manager.list_all_ids().await {
             Ok(ids) => Ok(!ids.is_empty()),
             Err(Error::IoUnexpected { ref source, .. })
                 if source.kind() == opendal::ErrorKind::NotFound =>
@@ -313,7 +311,7 @@ impl Catalog for FileSystemCatalog {
             return Ok(());
         }
 
-        let tables = self.list_directories(&path).await?;
+        let tables = self.list_tables(name).await?;
         if !tables.is_empty() && !cascade {
             return Err(Error::DatabaseNotEmpty {
                 database: name.to_string(),
@@ -362,8 +360,6 @@ impl Catalog for FileSystemCatalog {
             });
         }
 
-        // Mirror Java's listTablesInFileSystem: only include directories that
-        // contain at least one schema file (i.e. are valid Paimon tables).
         let dirs = self.list_directories(&path).await?;
         let mut tables = Vec::new();
         for dir in dirs {
@@ -533,6 +529,12 @@ mod tests {
         (temp_dir, catalog)
     }
 
+    fn create_memory_catalog() -> FileSystemCatalog {
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, "memory:/warehouse");
+        FileSystemCatalog::new(options).unwrap()
+    }
+
     fn testing_schema() -> Schema {
         Schema::builder()
             .column(
@@ -600,6 +602,54 @@ mod tests {
 
         // drop database with cascade
         catalog.drop_database("db1", false, true).await.unwrap();
+        assert!(!catalog.database_exists("db1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_memory_database_directory_existence() {
+        let catalog = create_memory_catalog();
+
+        catalog
+            .create_database("empty", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog.get_database("empty").await.unwrap();
+
+        let result = catalog
+            .create_database("empty", false, HashMap::new())
+            .await;
+        assert!(matches!(result, Err(Error::DatabaseAlreadyExist { .. })));
+
+        catalog
+            .file_io()
+            .new_output("memory:/warehouse/markerless.db/table/data/file")
+            .unwrap()
+            .write(Bytes::from("data"))
+            .await
+            .unwrap();
+        catalog.get_database("markerless").await.unwrap();
+        assert!(catalog
+            .list_databases()
+            .await
+            .unwrap()
+            .contains(&"markerless".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_drop_database_ignores_incomplete_table_directories() {
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .file_io()
+            .mkdirs("memory:/warehouse/db1.db/incomplete")
+            .await
+            .unwrap();
+
+        assert!(catalog.list_tables("db1").await.unwrap().is_empty());
+        catalog.drop_database("db1", false, false).await.unwrap();
         assert!(!catalog.database_exists("db1").await.unwrap());
     }
 
@@ -683,6 +733,38 @@ mod tests {
         let tables = catalog.list_tables("db1").await.unwrap();
         assert_eq!(tables.len(), 2);
         assert!(!tables.contains(&"table1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_memory_table_existence_requires_schema() {
+        let catalog = create_memory_catalog();
+        let valid_table = Identifier::new("db1", "valid");
+        let invalid_table = Identifier::new("db1", "invalid");
+        let table_schema = TableSchema::new(1, &testing_schema());
+
+        catalog
+            .file_io()
+            .new_output("memory:/warehouse/db1.db/valid/schema/schema-1")
+            .unwrap()
+            .write(Bytes::from(serde_json::to_string(&table_schema).unwrap()))
+            .await
+            .unwrap();
+        catalog
+            .file_io()
+            .mkdirs("memory:/warehouse/db1.db/invalid")
+            .await
+            .unwrap();
+
+        assert!(catalog.table_exists(&valid_table).await.unwrap());
+        let table = catalog.get_table(&valid_table).await.unwrap();
+        assert_eq!(table.schema().id(), 1);
+        let tables = catalog.list_tables("db1").await.unwrap();
+        assert!(tables.contains(&"valid".to_string()));
+        assert!(!tables.contains(&"invalid".to_string()));
+
+        assert!(!catalog.table_exists(&invalid_table).await.unwrap());
+        let result = catalog.get_table(&invalid_table).await;
+        assert!(matches!(result, Err(Error::TableNotExist { .. })));
     }
 
     #[tokio::test]
